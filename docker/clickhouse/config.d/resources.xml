@@ -1,0 +1,11 @@
+<!-- Laptop-friendly limits: the whole stack (PG + CH + Airflow + Superset) must fit into ~6 GB RAM. -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+    <max_server_memory_usage_to_ram_ratio>0.3</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>268435456</mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+</clickhouse>

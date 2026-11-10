@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+catboost_info/
+*.7z
+*.zip
+.idea/
+.vscode/
+.DS_Store
+
+# Assignment materials: kept locally, not published
+TASK.md
+attachments/

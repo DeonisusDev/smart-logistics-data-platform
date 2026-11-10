@@ -1,0 +1,211 @@
+# One command: docker-compose up
+#
+#   postgres          PostgreSQL 17: source schema + deterministic synthetic data, DWH (core/mart),
+#                     metadata DBs of Airflow and Superset
+#   clickhouse        ClickHouse 24.8 LTS: analytical layer on MergeTree (bonus)
+#   pipeline          one-shot run of the mandatory part: ETL -> ML -> ClickHouse sync, then exits 0
+#   airflow-*         the same pipeline as a scheduled DAG (bonus), UI on :8080
+#   superset-*        dashboard over ClickHouse (bonus), UI on :8088
+#   tests             optional: docker-compose run --rm tests
+x-pipeline-env: &pipeline-env
+  DB_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-deals_bigdata}
+  AS_OF: ${AS_OF:-2026-10-26}
+  RANDOM_SEED: ${RANDOM_SEED:-42}
+  MODEL_NAME: ${MODEL_NAME:-catboost}
+  LOG_FORMAT: ${LOG_FORMAT:-text}
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: analytics
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+  CLICKHOUSE_DATABASE: analytics
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: smart-logistics-airflow:local
+  environment: &airflow-env
+    <<: *pipeline-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-airflow}
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+
+x-superset: &superset
+  build:
+    context: .
+    dockerfile: docker/superset/Dockerfile
+  image: smart-logistics-superset:local
+  environment: &superset-env
+    SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-superset-secret-key}
+    SUPERSET_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/superset
+    SUPERSET_DWH_URI: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-deals_bigdata}
+    SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:-admin}
+    SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: "8123"
+    CLICKHOUSE_USER: analytics
+    CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    CLICKHOUSE_DATABASE: analytics
+    SERVER_WORKER_AMOUNT: "2"
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./sql/synthetic.sql:/docker-entrypoint-initdb.d/02-synthetic.sql:ro
+      - ./sql/ready.sql:/docker-entrypoint-initdb.d/03-ready.sql:ro
+      - ./docker/postgres/04-service-databases.sql:/docker-entrypoint-initdb.d/04-service-databases.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: during init the entrypoint runs a temporary server on the unix socket
+      # only, so the check passes only on the final server, after all init scripts have finished.
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1 FROM _synthetic_ready LIMIT 1' | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 120
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8.11.5
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CH_ANALYTICS_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DATABASE: ${POSTGRES_DB:-deals_bigdata}
+      PG_USER: ${POSTGRES_USER:-postgres}
+      PG_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/named_collections.xml:/etc/clickhouse-server/config.d/named_collections.xml:ro
+      - ./docker/clickhouse/config.d/resources.xml:/etc/clickhouse-server/config.d/resources.xml:ro
+      - ./docker/clickhouse/users.d/analytics.xml:/etc/clickhouse-server/users.d/analytics.xml:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    environment:
+      <<: *pipeline-env
+      START_DATE: ${START_DATE:-}
+      END_DATE: ${END_DATE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  airflow-init:
+    <<: *airflow
+    # official image entrypoint: migrate the metadata DB and create the admin user, then exit
+    command: version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  superset-init:
+    <<: *superset
+    command: ["/app/bootstrap/bootstrap.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # datasets are built from the real ClickHouse schema, so wait for the first pipeline run
+      pipeline:
+        condition: service_completed_successfully
+
+  superset:
+    <<: *superset
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8088/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: test
+    environment:
+      <<: *pipeline-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  chdata:
